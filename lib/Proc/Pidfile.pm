@@ -127,20 +127,20 @@ sub _create_pidfile
         }
         else {
             $self->_verbose( "$pid has died - replacing pidfile\n" );
-            open( PID, ">$pidfile" ) or croak "Can't write to $pidfile\n";
-            print PID "$$\n";
-            close( PID );
+            open( my $PID, ">", $pidfile ) or croak "Can't write to $pidfile\n";
+            print $PID "$$\n";
+            close( $PID );
             last;
         }
     }
 
     if (not -e $pidfile) {
         $self->_verbose( "no pidfile $pidfile\n" );
-        open( PID, ">$pidfile" ) or croak "Can't write to $pidfile: $!\n";
-        flock( PID, LOCK_EX ) or croak "Can't lock pid file $pidfile\n";
-        print PID "$$\n" or croak "Can't write to pid file $pidfile\n";
-        flock( PID, LOCK_UN );
-        close( PID ) or croak "Can't close pid file $pidfile: $!\n";
+        open( my $PID, ">$pidfile" ) or croak "Can't write to $pidfile: $!\n";
+        flock( $PID, LOCK_EX ) or croak "Can't lock pid file $pidfile\n";
+        print $PID "$$\n" or croak "Can't write to pid file $pidfile\n";
+        flock( $PID, LOCK_UN );
+        close( $PID ) or croak "Can't close pid file $pidfile: $!\n";
         $self->_verbose( "pidfile $pidfile created\n" );
     }
 
