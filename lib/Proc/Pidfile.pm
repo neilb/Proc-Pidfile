@@ -7,7 +7,7 @@ use warnings;
 use Fcntl                   qw/ :flock         /;
 use File::Basename          qw/ basename       /;
 use Carp                    qw/ carp croak     /;
-use Time::HiRes             qw/ usleep         /;
+use Time::HiRes             qw/ usleep time    /;
 use File::Spec::Functions   qw/ catfile tmpdir /;
 
 sub new 
@@ -62,7 +62,7 @@ sub _get_pid
     my $self = shift;
     my $pidfile = $self->{pidfile};
     $self->_verbose( "get pid from $pidfile\n" );
-    open( PID, $pidfile ) or croak "can't read pid file $pidfile\n";
+    open( PID, '<', $pidfile ) or croak "can't read pid file $pidfile\n";
     flock( PID, LOCK_SH ) or croak "can't lock pid file $pidfile\n";
     my $pid = <PID>;
     if (defined($pid) && $pid =~ /([0-9]+)/) {
@@ -98,45 +98,53 @@ sub _create_pidfile
 {
     my $self    = shift;
     my $pidfile = $self->{pidfile};
-    my $attempt = 1;
+    my $maxwait = $self->{wait} // 0;
+    my ($attempt, $start, $delay);
 
     while ( -e $pidfile ) {
         $self->_verbose( "pidfile $pidfile exists\n" );
         my $pid = $self->_get_pid();
         $self->_verbose( "pid in pidfile $pidfile = $pid\n" );
-        if ( _is_running( $pid ) ) {
-            
-            # this might be a race condition, or parallel smoke testers,
-            # so we'll back off a random amount of time and try again
-            if ($attempt <= $self->{retries}) {
-                ++$attempt;
-                # TODO: let's try this. Guessing we don't have to
-                #       bother with increasing backoff times
-                my $backoff = 100 + rand(300);
-                $self->_verbose("backing off for $backoff microseconds before trying again");
-                usleep(100 + rand(300));
-                next;
-            }
-
-            if ( $self->{silent} ) {
-                exit;
-            }
-            else {
-                croak "$0 already running: $pid ($pidfile)\n";
-            }
-        }
-        else {
+        if (! _is_running( $pid ) ) {
             $self->_verbose( "$pid has died - replacing pidfile\n" );
-            open( PID, ">$pidfile" ) or croak "Can't write to $pidfile\n";
+            open( PID, '>', $pidfile ) or croak "Can't write to $pidfile\n";
             print PID "$$\n";
             close( PID );
             last;
+        }
+
+        # there's a live process using the pidfile we want!
+        ++$attempt;
+        $start //= time;
+        if ($delay) {
+            use integer;
+            # don't increase delay if it's over 1/4 total wait time
+            $delay += $delay / 6 unless $maxwait && 4 * $delay > $maxwait * 1_000_000;
+        } else {
+            # start short, but not too short!.
+            $delay = 200 + rand(150);
+        }
+
+        # this might be a race condition, or parallel smoke testers,
+        # so we'll back off a random amount of time and try again
+        if ($attempt <= $self->{retries} ||
+            $maxwait && time - $start < $maxwait) {
+            $self->_verbose("$attempt: waiting $delay microseconds before trying again");
+            usleep($delay);
+            next;
+        }
+
+        if ( $self->{silent} ) {
+            exit;
+        }
+        else {
+            croak "$0 already running: $pid ($pidfile)\n";
         }
     }
 
     if (not -e $pidfile) {
         $self->_verbose( "no pidfile $pidfile\n" );
-        open( PID, ">$pidfile" ) or croak "Can't write to $pidfile: $!\n";
+        open( PID, '>', $pidfile ) or croak "Can't write to $pidfile: $!\n";
         flock( PID, LOCK_EX ) or croak "Can't lock pid file $pidfile\n";
         print PID "$$\n" or croak "Can't write to pid file $pidfile\n";
         flock( PID, LOCK_UN );
@@ -145,6 +153,11 @@ sub _create_pidfile
     }
 
     $self->{created} = 1;
+    # mostly useful for debugging:
+    $self->{pid} = $$;
+    $self->{_attempts} = $attempt if $attempt;
+    $self->{_time}     = time - $start if $start;
+    $self->{_delay}    = $delay if $delay;
 }
 
 sub _destroy_pidfile
@@ -191,27 +204,32 @@ the current process
 
 =head1 SYNOPSIS
 
-    my $pp = Proc::Pidfile->new( pidfile => "/path/to/your/pidfile" );
-    # if the pidfile already exists, die here
-    $pidfile = $pp->pidfile();
-    undef $pp;
-    # unlink $pidfile here
-
-    my $pp = Proc::Pidfile->new();
-    # creates pidfile in default location
-    my $pidfile = $pp->pidfile();
-    # tells you where this pidfile is ...
-
-    my $pp = Proc::Pidfile->new( silent => 1 );
-    # if the pidfile already exists, exit silently here
+    my $pp = Proc::Pidfile->new();   # create pidfile in default location, or
+                                     # die if another process already running.
+    my $pidfile = $pp->pidfile();    # find out where file is
     ...
-    undef $pp;
+    undef $pp;                       # unlink the pidfile
+
+    # other constructor options:
+    pidfile => "/path/to/your/pidfile"    # specify path of the pidfile
+    silent  => 1          # exit instead of dying, when can't acquire pidfile
+    retries => 0          # specify number of retries before failing (default 2)
+    wait    => 30         # wait up to 30sec to acquire the pidfile
 
 =head1 DESCRIPTION
 
 Proc::Pidfile is a very simple OO interface which manages a pidfile for the
-current process.
-You can pass the path to a pidfile to use as an argument to the constructor,
+current process.  
+
+The constructor C<new> will create a pidfile if none exists, or re-use an 
+existing one if it is stale (the pid recorded is no longer running).
+The created object's pidfile will automatically be removed when this object 
+is destroyed.  
+If the pidfile exists and the recorded pid is still running, the constructor
+will pause briefly and retry twice (by default), and failing that, 
+then will die (default), or optionally exit.
+
+You can specify the path to a pidfile to use as an argument to the constructor,
 or you can let Proc::Pidfile choose one
 ("/$tmpdir/$basename", where C<$tmpdir> is from C<File::Spec>).
 
@@ -221,29 +239,30 @@ against its own, and against its parents (in case it is a spawned child of the
 process that originally created the Proc::Pidfile object), and barfs if it
 doesn't match either.
 
-If you pass a "silent" parameter to the constructor, then it will still check
-for the existence of a pidfile, but will exit silently if one is found. This is
-useful for, for example, cron jobs, where you don't want to create a new
+=head2 Retries and Waiting
+
+If another instance of your script is already running, the constructor will 
+pause and retry two (2) times (for a total of three attempts) to acquire the
+pidfile, with a random delay of a few hundred microseconds between attempts.
+
+You can specify the number of retries in the constructor, or set it to 0 to 
+disable this feature.
+
+If you give the C<wait> option, the constructor will retry automatically, for 
+up to the specified number seconds, before giving up.  Waits of less than 
+one second are permitted.  This option overrides the C<retries> option.  
+
+The time between attempts to acquire the pidfile will grow exponentially,
+but will never exceed 30% of the max wait time (if specified).
+
+=head2 Silent
+
+If you pass a C<silent> parameter to the constructor, then it will exit with 
+status 0 instead of dying, when another process is still running (after any retries).
+
+This is useful for e.g. cron jobs, where you don't want to create a new
 process if one is already running, but you don't necessarily want to be
 informed of this by cron.
-
-=head2 Retries
-
-If another instance of your script is already running,
-we'll retry a couple of times,
-with a random number of microseconds between each attempt.
-
-You can specify the number of retries, for example if you
-want to try more times for some reason:
-
- $pidfile = $pp->pidfile(retries => 4);
-
-By default this is set to 2,
-which means if the first attempt to set up a pidfile fails,
-it will try 2 more times, so three attempts in total.
-
-Setting retries to 0 (zero) will disable this feature.
-
 
 =head1 SEE ALSO
 
